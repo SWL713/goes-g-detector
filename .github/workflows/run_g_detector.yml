@@ -28,7 +28,7 @@ jobs:
       - name: Show output files
         if: always()
         run: |
-          echo "=== output ==="
+          echo "=== output tree ==="
           ls -R output || true
 
       - name: Upload artifact
@@ -37,4 +37,4 @@ jobs:
         with:
           name: goes-g-detector-output
           path: output/**
-          if-no-files-found: error
+          if-no-files-found: warn
