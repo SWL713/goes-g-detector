@@ -1,72 +1,370 @@
-Skip to content
-SWL713
-goes-g-detector
-Repository navigation
-Code
-Issues
-Pull requests
-Actions
-Projects
-Wiki
-Security
-Insights
-Settings
-GOES G Detector
-GOES G Detector #1
-All jobs
-Run details
-Annotations
-2 errors
-detect-g
-failed 1 minute ago in 25s
-Search logs
-1s
-0s
-0s
-18s
-3s
-Run python src/run_g_detector.py
-Traceback (most recent call last):
-  File "/home/runner/work/goes-g-detector/goes-g-detector/src/run_g_detector.py", line 352, in <module>
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+import matplotlib
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+from scipy.signal import find_peaks
+
+
+OUTDIR = Path(__file__).resolve().parent.parent / "output"
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+BASE = "https://services.swpc.noaa.gov/json/goes"
+URL_PRIMARY = f"{BASE}/primary/magnetometers-7-day.json"
+URL_SECONDARY = f"{BASE}/secondary/magnetometers-7-day.json"
+URL_SOURCES = f"{BASE}/instrument-sources.json"
+URL_LONGITUDES = f"{BASE}/satellite-longitudes.json"
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "goes-g-detector/0.2"})
+
+
+@dataclass
+class DetectionResult:
+    timestamp: pd.Timestamp
+    source: str
+    score: float
+    note: str
+
+
+def fetch_json(url: str):
+    response = SESSION.get(url, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def load_metadata() -> dict:
+    sources = fetch_json(URL_SOURCES)
+    longitudes = fetch_json(URL_LONGITUDES)
+
+    if isinstance(sources, list) and len(sources) > 0:
+        sources = sources[-1]
+
+    lon_map = {}
+    if isinstance(longitudes, list):
+        for row in longitudes:
+            sat = row.get("satellite")
+            lon = row.get("longitude")
+            try:
+                if sat is not None and lon is not None:
+                    lon_map[int(sat)] = float(lon)
+            except Exception:
+                continue
+
+    mag_sources = sources.get("magnetometers", {}) if isinstance(sources, dict) else {}
+    primary_sat = mag_sources.get("primary")
+    secondary_sat = mag_sources.get("secondary")
+
+    return {
+        "primary_sat": int(primary_sat) if primary_sat is not None else None,
+        "secondary_sat": int(secondary_sat) if secondary_sat is not None else None,
+        "longitudes": lon_map,
+    }
+
+
+def normalize_mag_json(data, source_name: str) -> pd.DataFrame:
+    df = pd.DataFrame(data)
+    if df.empty:
+        raise ValueError(f"{source_name} dataset is empty")
+
+    time_col = None
+    for col in df.columns:
+        low = col.lower()
+        if low in {"time_tag", "time", "date"} or "time" in low:
+            time_col = col
+            break
+
+    if time_col is None:
+        raise ValueError(f"No time column found in {source_name}: {list(df.columns)}")
+
+    df["time_utc"] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+    df = df.dropna(subset=["time_utc"]).copy()
+
+    rename = {}
+    for col in df.columns:
+        low = col.lower()
+        if low in {"hp", "h_p"}:
+            rename[col] = "Hp"
+        elif low in {"he", "h_e"}:
+            rename[col] = "He"
+        elif low in {"hn", "h_n"}:
+            rename[col] = "Hn"
+        elif low in {"ht", "bt", "total", "total_field"}:
+            rename[col] = "Ht"
+        elif low == "satellite":
+            rename[col] = "satellite"
+
+    df = df.rename(columns=rename)
+
+    keep = ["time_utc"] + [c for c in ["Hp", "He", "Hn", "Ht", "satellite"] if c in df.columns]
+    df = df[keep].copy()
+    df["source_feed"] = source_name
+    df = df.sort_values("time_utc").drop_duplicates(subset=["time_utc"])
+
+    return df
+
+
+def choose_east_west(primary_df: pd.DataFrame, secondary_df: pd.DataFrame, meta: dict) -> dict:
+    lon_map = meta["longitudes"]
+    primary_sat = meta["primary_sat"]
+    secondary_sat = meta["secondary_sat"]
+
+    primary_lon = lon_map.get(primary_sat)
+    secondary_lon = lon_map.get(secondary_sat)
+
+    candidates = [
+        ("primary", primary_df, primary_sat, primary_lon),
+        ("secondary", secondary_df, secondary_sat, secondary_lon),
+    ]
+    candidates = [c for c in candidates if c[3] is not None]
+
+    if len(candidates) < 2:
+        raise ValueError("Could not resolve both GOES longitudes from SWPC metadata")
+
+    east = min(candidates, key=lambda x: x[3])
+    west = max(candidates, key=lambda x: x[3])
+
+    return {
+        "east_name": east[0],
+        "east_df": east[1],
+        "east_sat": east[2],
+        "east_lon": east[3],
+        "west_name": west[0],
+        "west_df": west[1],
+        "west_sat": west[2],
+        "west_lon": west[3],
+    }
+
+
+def prep_trace(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy().sort_values("time_utc")
+
+    if "Hp" not in out.columns:
+        raise ValueError(f"This script expects an Hp column. Columns found: {list(out.columns)}")
+
+    keep_cols = ["time_utc"] + [c for c in ["Hp", "He", "Hn", "Ht"] if c in out.columns]
+    out = out[keep_cols].copy()
+
+    for col in ["Hp", "He", "Hn", "Ht"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.dropna(subset=["Hp"]).copy()
+
+    print("prep_trace columns:", list(out.columns))
+    print("prep_trace rows before resample:", len(out))
+
+    out = (
+        out.set_index("time_utc")
+        .resample("1min")
+        .median(numeric_only=True)
+        .interpolate(limit=5)
+        .reset_index()
+    )
+
+    if out.empty:
+        raise ValueError("Trace is empty after resampling")
+
+    out["hp_smooth_5"] = out["Hp"].rolling(5, center=True, min_periods=1).median()
+    out["hp_baseline_180"] = out["hp_smooth_5"].rolling(180, center=True, min_periods=30).median()
+    out["hp_resid"] = out["hp_smooth_5"] - out["hp_baseline_180"]
+    out["d1"] = out["hp_smooth_5"].diff()
+
+    return out
+
+
+def detect_g_candidates(df: pd.DataFrame, source_label: str) -> List[DetectionResult]:
+    work = df.copy().reset_index(drop=True)
+    y = work["hp_resid"].to_numpy()
+
+    if len(y) < 120:
+        return []
+
+    peak_idx, _ = find_peaks(y, prominence=3.0, distance=20)
+
+    if len(peak_idx) == 0:
+        return []
+
+    clusters = []
+    current = [int(peak_idx[0])]
+    for idx in peak_idx[1:]:
+        idx = int(idx)
+        if idx - current[-1] <= 25:
+            current.append(idx)
+        else:
+            clusters.append(current)
+            current = [idx]
+    clusters.append(current)
+
+    final_peaks = [cluster[-1] for cluster in clusters]
+
+    detections: List[DetectionResult] = []
+
+    for peak in final_peaks:
+        start_search = peak + 5
+        end_search = min(peak + 90, len(work) - 61)
+        if start_search >= end_search:
+            continue
+
+        best_idx: Optional[int] = None
+        best_score = -np.inf
+
+        for i in range(start_search, end_search):
+            future_45 = work.loc[i + 45, "hp_smooth_5"] - work.loc[i, "hp_smooth_5"]
+            future_20 = work.loc[i + 20, "hp_smooth_5"] - work.loc[i, "hp_smooth_5"]
+            neg_frac_20 = (work.loc[i + 1:i + 20, "d1"] < 0).mean()
+            prev_slope_10 = work.loc[i, "hp_smooth_5"] - work.loc[max(0, i - 10), "hp_smooth_5"]
+
+            score = (
+                (-future_45) * 1.0
+                + (-future_20) * 0.6
+                + neg_frac_20 * 8.0
+                - abs(prev_slope_10) * 0.25
+            )
+
+            if future_45 <= -6.0 and future_20 <= -2.0 and neg_frac_20 >= 0.60:
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+
+        if best_idx is not None:
+            detections.append(
+                DetectionResult(
+                    timestamp=work.loc[best_idx, "time_utc"],
+                    source=source_label,
+                    score=float(best_score),
+                    note="after final release peak",
+                )
+            )
+
+    detections = sorted(detections, key=lambda d: d.timestamp)
+    filtered: List[DetectionResult] = []
+
+    for det in detections:
+        if not filtered:
+            filtered.append(det)
+            continue
+
+        dt_minutes = (det.timestamp - filtered[-1].timestamp).total_seconds() / 60.0
+        if dt_minutes < 90:
+            if det.score > filtered[-1].score:
+                filtered[-1] = det
+        else:
+            filtered.append(det)
+
+    return filtered
+
+
+def pick_trace(east_df: pd.DataFrame, west_df: pd.DataFrame):
+    east_prepped = prep_trace(east_df)
+    east_candidates = detect_g_candidates(east_prepped, "GOES-East")
+    if len(east_candidates) >= 1:
+        return east_prepped, east_candidates, "GOES-East"
+
+    west_prepped = prep_trace(west_df)
+    west_candidates = detect_g_candidates(west_prepped, "GOES-West fallback")
+    return west_prepped, west_candidates, "GOES-West fallback"
+
+
+def save_outputs(trace_df: pd.DataFrame, detections: List[DetectionResult], chosen_source: str, meta: dict) -> None:
+    trace_df.to_csv(OUTDIR / "goes_trace_used.csv", index=False)
+
+    detections_df = pd.DataFrame(
+        [
+            {
+                "g_time_utc": det.timestamp.isoformat(),
+                "source": det.source,
+                "score": det.score,
+                "note": det.note,
+            }
+            for det in detections
+        ]
+    )
+    detections_df.to_csv(OUTDIR / "g_candidates.csv", index=False)
+
+    fig = plt.figure(figsize=(16, 7))
+    ax = fig.add_subplot(111)
+
+    ax.plot(trace_df["time_utc"], trace_df["Hp"], label="Hp raw", linewidth=0.8)
+    ax.plot(trace_df["time_utc"], trace_df["hp_smooth_5"], label="Hp smooth", linewidth=1.5)
+
+    ymax = float(trace_df["hp_smooth_5"].max())
+    ymin = float(trace_df["hp_smooth_5"].min())
+    ytext = ymax - 0.03 * (ymax - ymin if ymax != ymin else 1.0)
+
+    for det in detections:
+        ax.axvline(det.timestamp, linewidth=1.2)
+        ax.text(
+            det.timestamp,
+            ytext,
+            det.timestamp.strftime("%m-%d %H:%M"),
+            rotation=90,
+            va="top",
+            ha="right",
+            fontsize=8,
+        )
+
+    title = (
+        f"7-day GOES G detector ({chosen_source}) | "
+        f"primary sat={meta['primary_sat']} secondary sat={meta['secondary_sat']}"
+    )
+    ax.set_title(title)
+    ax.set_xlabel("UTC")
+    ax.set_ylabel("Hp (nT)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(OUTDIR / "goes_g_detector_plot.png", dpi=180)
+    plt.close(fig)
+
+
+def main() -> None:
+    try:
+        meta = load_metadata()
+
+        primary_df = normalize_mag_json(fetch_json(URL_PRIMARY), "primary")
+        secondary_df = normalize_mag_json(fetch_json(URL_SECONDARY), "secondary")
+
+        resolved = choose_east_west(primary_df, secondary_df, meta)
+        chosen_trace, detections, chosen_source = pick_trace(resolved["east_df"], resolved["west_df"])
+
+        metadata_summary = {
+            "primary_satellite": meta["primary_sat"],
+            "secondary_satellite": meta["secondary_sat"],
+            "primary_longitude": meta["longitudes"].get(meta["primary_sat"]),
+            "secondary_longitude": meta["longitudes"].get(meta["secondary_sat"]),
+            "east_resolved_feed": resolved["east_name"],
+            "east_satellite": resolved["east_sat"],
+            "east_longitude": resolved["east_lon"],
+            "west_resolved_feed": resolved["west_name"],
+            "west_satellite": resolved["west_sat"],
+            "west_longitude": resolved["west_lon"],
+            "chosen_source_for_detection": chosen_source,
+            "n_detections": len(detections),
+        }
+
+        with open(OUTDIR / "metadata_summary.json", "w", encoding="utf-8") as f:
+            json.dump(metadata_summary, f, indent=2, default=str)
+
+        save_outputs(chosen_trace, detections, chosen_source, meta)
+
+        print("Done.")
+        print(json.dumps(metadata_summary, indent=2, default=str))
+
+    except Exception as exc:
+        with open(OUTDIR / "run_error.json", "w", encoding="utf-8") as f:
+            json.dump({"error": str(exc)}, f, indent=2)
+        print(f"ERROR: {exc}")
+        raise
+
+
+if __name__ == "__main__":
     main()
-  File "/home/runner/work/goes-g-detector/goes-g-detector/src/run_g_detector.py", line 324, in main
-    chosen_trace, detections, chosen_source = pick_trace(resolved["east_df"], resolved["west_df"])
-                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/runner/work/goes-g-detector/goes-g-detector/src/run_g_detector.py", line 259, in pick_trace
-    east_candidates = detect_g_candidates(prep_trace(east_df), "GOES-East")
-                                          ^^^^^^^^^^^^^^^^^^^
-  File "/home/runner/work/goes-g-detector/goes-g-detector/src/run_g_detector.py", line 155, in prep_trace
-    out = out.set_index("time_utc").resample("1min").median().interpolate(limit=5).reset_index()
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/resample.py", line 1478, in median
-    return self._downsample("median", numeric_only=numeric_only)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/resample.py", line 2102, in _downsample
-    result = obj.groupby(self._grouper).aggregate(how, **kwargs)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/groupby/generic.py", line 2291, in aggregate
-    result = op.agg()
-             ^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/apply.py", line 291, in agg
-    return self.apply_str()
-           ^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/apply.py", line 701, in apply_str
-    return self._apply_str(obj, func, *self.args, **self.kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/apply.py", line 792, in _apply_str
-    return f(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/groupby/groupby.py", line 2385, in median
-    result = self._cython_agg_general(
-             ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/groupby/groupby.py", line 1808, in _cython_agg_general
-    new_mgr = data.grouped_reduce(array_func)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.14/x64/lib/python3.11/site-packages/pandas/core/internals/managers.py", line 1646, in grouped_reduce
-    applied = blk.apply(func)
-              ^^^^^^^^^^^^^^^
-0s
-0s
-0s
-1s
-0s
