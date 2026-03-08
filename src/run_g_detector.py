@@ -25,7 +25,7 @@ URL_SOURCES = f"{BASE}/instrument-sources.json"
 URL_LONGITUDES = f"{BASE}/satellite-longitudes.json"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "goes-g-detector/0.2"})
+SESSION.headers.update({"User-Agent": "goes-g-detector/0.3"})
 
 
 @dataclass
@@ -33,7 +33,9 @@ class DetectionResult:
     timestamp: pd.Timestamp
     source: str
     score: float
+    status: str
     note: str
+    peak_time: pd.Timestamp
 
 
 def fetch_json(url: str):
@@ -160,9 +162,6 @@ def prep_trace(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.dropna(subset=["Hp"]).copy()
 
-    print("prep_trace columns:", list(out.columns))
-    print("prep_trace rows before resample:", len(out))
-
     out = (
         out.set_index("time_utc")
         .resample("1min")
@@ -174,12 +173,52 @@ def prep_trace(df: pd.DataFrame) -> pd.DataFrame:
     if out.empty:
         raise ValueError("Trace is empty after resampling")
 
-    out["hp_smooth_5"] = out["Hp"].rolling(5, center=True, min_periods=1).median()
-    out["hp_baseline_180"] = out["hp_smooth_5"].rolling(180, center=True, min_periods=30).median()
-    out["hp_resid"] = out["hp_smooth_5"] - out["hp_baseline_180"]
-    out["d1"] = out["hp_smooth_5"].diff()
+    # Light smoothing keeps short-timescale events
+    out["hp_smooth_3"] = out["Hp"].rolling(3, center=True, min_periods=1).median()
+    out["hp_baseline_180"] = out["hp_smooth_3"].rolling(180, center=True, min_periods=30).median()
+    out["hp_resid"] = out["hp_smooth_3"] - out["hp_baseline_180"]
+    out["d1"] = out["hp_smooth_3"].diff()
+    out["d2"] = out["d1"].diff()
 
     return out
+
+
+def trough_depth_between(work: pd.DataFrame, i1: int, i2: int) -> float:
+    if i2 <= i1 + 1:
+        return 0.0
+    y1 = float(work.loc[i1, "hp_smooth_3"])
+    y2 = float(work.loc[i2, "hp_smooth_3"])
+    trough = float(work.loc[i1:i2, "hp_smooth_3"].min())
+    return min(y1, y2) - trough
+
+
+def cluster_peaks(work: pd.DataFrame, peak_idx: np.ndarray) -> List[List[int]]:
+    """
+    Merge true double peaks, but allow closely spaced separate events.
+    """
+    if len(peak_idx) == 0:
+        return []
+
+    clusters: List[List[int]] = []
+    current = [int(peak_idx[0])]
+
+    for raw_idx in peak_idx[1:]:
+        idx = int(raw_idx)
+        prev = current[-1]
+        dt = idx - prev
+        trough_depth = trough_depth_between(work, prev, idx)
+
+        # Merge only if very close and intervening dip is shallow
+        should_merge = (dt <= 12 and trough_depth < 4.0)
+
+        if should_merge:
+            current.append(idx)
+        else:
+            clusters.append(current)
+            current = [idx]
+
+    clusters.append(current)
+    return clusters
 
 
 def detect_g_candidates(df: pd.DataFrame, source_label: str) -> List[DetectionResult]:
@@ -189,29 +228,20 @@ def detect_g_candidates(df: pd.DataFrame, source_label: str) -> List[DetectionRe
     if len(y) < 120:
         return []
 
-    peak_idx, _ = find_peaks(y, prominence=3.0, distance=20)
+    # More sensitive to smaller sharp peaks
+    peak_idx, props = find_peaks(y, prominence=1.8, distance=8)
 
     if len(peak_idx) == 0:
         return []
 
-    clusters = []
-    current = [int(peak_idx[0])]
-    for idx in peak_idx[1:]:
-        idx = int(idx)
-        if idx - current[-1] <= 25:
-            current.append(idx)
-        else:
-            clusters.append(current)
-            current = [idx]
-    clusters.append(current)
-
+    clusters = cluster_peaks(work, peak_idx)
     final_peaks = [cluster[-1] for cluster in clusters]
 
     detections: List[DetectionResult] = []
 
     for peak in final_peaks:
-        start_search = peak + 5
-        end_search = min(peak + 90, len(work) - 61)
+        start_search = peak + 2
+        end_search = min(peak + 45, len(work) - 46)
         if start_search >= end_search:
             continue
 
@@ -219,43 +249,65 @@ def detect_g_candidates(df: pd.DataFrame, source_label: str) -> List[DetectionRe
         best_score = -np.inf
 
         for i in range(start_search, end_search):
-            future_45 = work.loc[i + 45, "hp_smooth_5"] - work.loc[i, "hp_smooth_5"]
-            future_20 = work.loc[i + 20, "hp_smooth_5"] - work.loc[i, "hp_smooth_5"]
-            neg_frac_20 = (work.loc[i + 1:i + 20, "d1"] < 0).mean()
-            prev_slope_10 = work.loc[i, "hp_smooth_5"] - work.loc[max(0, i - 10), "hp_smooth_5"]
+            future_10 = work.loc[i + 10, "hp_smooth_3"] - work.loc[i, "hp_smooth_3"]
+            future_20 = work.loc[i + 20, "hp_smooth_3"] - work.loc[i, "hp_smooth_3"]
+            future_30 = work.loc[i + 30, "hp_smooth_3"] - work.loc[i, "hp_smooth_3"]
 
+            neg_frac_10 = (work.loc[i + 1:i + 10, "d1"] < 0).mean()
+            neg_frac_20 = (work.loc[i + 1:i + 20, "d1"] < 0).mean()
+
+            early_slope = work.loc[i + 5, "hp_smooth_3"] - work.loc[i, "hp_smooth_3"]
+            prev_5 = work.loc[i, "hp_smooth_3"] - work.loc[max(0, i - 5), "hp_smooth_3"]
+
+            # Reward earliest sustained negative turn and sharp charging
             score = (
-                (-future_45) * 1.0
-                + (-future_20) * 0.6
-                + neg_frac_20 * 8.0
-                - abs(prev_slope_10) * 0.25
+                (-future_10) * 1.5
+                + (-future_20) * 1.2
+                + (-future_30) * 0.8
+                + neg_frac_10 * 6.0
+                + neg_frac_20 * 4.0
+                + (-early_slope) * 1.5
+                - abs(prev_5) * 0.2
             )
 
-            if future_45 <= -6.0 and future_20 <= -2.0 and neg_frac_20 >= 0.60:
-                if score > best_score:
-                    best_score = score
-                    best_idx = i
+            valid = (
+                future_10 <= -1.5 and
+                future_20 <= -3.0 and
+                neg_frac_10 >= 0.60 and
+                neg_frac_20 >= 0.60
+            )
+
+            if valid and score > best_score:
+                best_score = score
+                best_idx = i
 
         if best_idx is not None:
+            # Status: provisional if close in time to peak, confirmed otherwise
+            dt_from_peak = best_idx - peak
+            status = "provisional" if dt_from_peak <= 12 else "confirmed"
+
             detections.append(
                 DetectionResult(
                     timestamp=work.loc[best_idx, "time_utc"],
                     source=source_label,
                     score=float(best_score),
-                    note="after final release peak",
+                    status=status,
+                    note="early sustained downslope after final release peak",
+                    peak_time=work.loc[peak, "time_utc"],
                 )
             )
 
     detections = sorted(detections, key=lambda d: d.timestamp)
-    filtered: List[DetectionResult] = []
 
+    # Allow substorms within an hour; only suppress very close duplicates
+    filtered: List[DetectionResult] = []
     for det in detections:
         if not filtered:
             filtered.append(det)
             continue
 
         dt_minutes = (det.timestamp - filtered[-1].timestamp).total_seconds() / 60.0
-        if dt_minutes < 90:
+        if dt_minutes < 35:
             if det.score > filtered[-1].score:
                 filtered[-1] = det
         else:
@@ -282,8 +334,10 @@ def save_outputs(trace_df: pd.DataFrame, detections: List[DetectionResult], chos
         [
             {
                 "g_time_utc": det.timestamp.isoformat(),
+                "peak_time_utc": det.peak_time.isoformat(),
                 "source": det.source,
                 "score": det.score,
+                "status": det.status,
                 "note": det.note,
             }
             for det in detections
@@ -291,22 +345,23 @@ def save_outputs(trace_df: pd.DataFrame, detections: List[DetectionResult], chos
     )
     detections_df.to_csv(OUTDIR / "g_candidates.csv", index=False)
 
-    fig = plt.figure(figsize=(16, 7))
+    fig = plt.figure(figsize=(18, 8))
     ax = fig.add_subplot(111)
 
     ax.plot(trace_df["time_utc"], trace_df["Hp"], label="Hp raw", linewidth=0.8)
-    ax.plot(trace_df["time_utc"], trace_df["hp_smooth_5"], label="Hp smooth", linewidth=1.5)
+    ax.plot(trace_df["time_utc"], trace_df["hp_smooth_3"], label="Hp smooth", linewidth=1.5)
 
-    ymax = float(trace_df["hp_smooth_5"].max())
-    ymin = float(trace_df["hp_smooth_5"].min())
-    ytext = ymax - 0.03 * (ymax - ymin if ymax != ymin else 1.0)
+    ymax = float(trace_df["hp_smooth_3"].max())
+    ymin = float(trace_df["hp_smooth_3"].min())
+    yspan = ymax - ymin if ymax != ymin else 1.0
+    ytext = ymax - 0.03 * yspan
 
     for det in detections:
         ax.axvline(det.timestamp, linewidth=1.2)
         ax.text(
             det.timestamp,
             ytext,
-            det.timestamp.strftime("%m-%d %H:%M"),
+            f"{det.timestamp.strftime('%m-%d %H:%M')}\n{det.status}",
             rotation=90,
             va="top",
             ha="right",
@@ -314,7 +369,7 @@ def save_outputs(trace_df: pd.DataFrame, detections: List[DetectionResult], chos
         )
 
     title = (
-        f"7-day GOES G detector ({chosen_source}) | "
+        f"7-day GOES G detector v2 ({chosen_source}) | "
         f"primary sat={meta['primary_sat']} secondary sat={meta['secondary_sat']}"
     )
     ax.set_title(title)
